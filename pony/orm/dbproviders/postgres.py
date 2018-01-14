@@ -1,21 +1,37 @@
 from __future__ import absolute_import
+from pony.py23compat import PY2, basestring, unicode, buffer, int_types
 
 from decimal import Decimal
-from datetime import datetime, date
+from datetime import datetime, date, time, timedelta
 from uuid import UUID
 
-import psycopg2
+try:
+    import psycopg2
+except ImportError:
+    try:
+        from psycopg2cffi import compat
+    except ImportError:
+        raise ImportError('In order to use PonyORM with PostgreSQL please install psycopg2 or psycopg2cffi')
+    else:
+        compat.register()
+
 from psycopg2 import extensions
 
 import psycopg2.extras
 psycopg2.extras.register_uuid()
 
-from pony.orm import core, dbschema, sqlbuilding, dbapiprovider
+psycopg2.extras.register_default_json(loads=lambda x: x)
+psycopg2.extras.register_default_jsonb(loads=lambda x: x)
+
+from pony.orm import core, dbschema, dbapiprovider, sqltranslation, ormtypes
 from pony.orm.core import log_orm
-from pony.orm.dbapiprovider import DBAPIProvider, Pool, ProgrammingError, wrap_dbapi_exceptions
+from pony.orm.dbapiprovider import DBAPIProvider, Pool, wrap_dbapi_exceptions
 from pony.orm.sqltranslation import SQLTranslator
-from pony.orm.sqlbuilding import Value
-from pony.utils import throw
+from pony.orm.sqlbuilding import Value, SQLBuilder
+from pony.converting import timedelta2str
+from pony.utils import is_ident
+
+NoneType = type(None)
 
 class PGColumn(dbschema.Column):
     auto_template = 'SERIAL PRIMARY KEY'
@@ -33,13 +49,14 @@ class PGValue(Value):
         value = self.value
         if isinstance(value, bool): return value and 'true' or 'false'
         return Value.__unicode__(self)
+    if not PY2: __str__ = __unicode__
 
-class PGSQLBuilder(sqlbuilding.SQLBuilder):
+class PGSQLBuilder(SQLBuilder):
     dialect = 'PostgreSQL'
-    make_value = PGValue
+    value_class = PGValue
     def INSERT(builder, table_name, columns, values, returning=None):
         if not values: result = [ 'INSERT INTO ', builder.quote_name(table_name) ,' DEFAULT VALUES' ]
-        else: result = sqlbuilding.SQLBuilder.INSERT(builder, table_name, columns, values)
+        else: result = SQLBuilder.INSERT(builder, table_name, columns, values)
         if returning is not None: result.extend([' RETURNING ', builder.quote_name(returning) ])
         return result
     def TO_INT(builder, expr):
@@ -48,26 +65,62 @@ class PGSQLBuilder(sqlbuilding.SQLBuilder):
         return '(', builder(expr), ')::date'
     def RANDOM(builder):
         return 'random()'
-
-class PGUnicodeConverter(dbapiprovider.UnicodeConverter):
-    def py2sql(converter, val):
-        return val.encode('utf-8')
-    def sql2py(converter, val):
-        if isinstance(val, unicode): return val
-        return val.decode('utf-8')
+    def DATE_ADD(builder, expr, delta):
+        if isinstance(delta, timedelta):
+            return '(', builder(expr), " + INTERVAL '", timedelta2str(delta), "' DAY TO SECOND)"
+        return '(', builder(expr), ' + ', builder(delta), ')'
+    def DATE_SUB(builder, expr, delta):
+        if isinstance(delta, timedelta):
+            return '(', builder(expr), " - INTERVAL '", timedelta2str(delta), "' DAY TO SECOND)"
+        return '(', builder(expr), ' - ', builder(delta), ')'
+    def DATETIME_ADD(builder, expr, delta):
+        if isinstance(delta, timedelta):
+            return '(', builder(expr), " + INTERVAL '", timedelta2str(delta), "' DAY TO SECOND)"
+        return '(', builder(expr), ' + ', builder(delta), ')'
+    def DATETIME_SUB(builder, expr, delta):
+        if isinstance(delta, timedelta):
+            return '(', builder(expr), " - INTERVAL '", timedelta2str(delta), "' DAY TO SECOND)"
+        return '(', builder(expr), ' - ', builder(delta), ')'
+    def eval_json_path(builder, values):
+        result = []
+        for value in values:
+            if isinstance(value, int):
+                result.append(str(value))
+            elif isinstance(value, basestring):
+                result.append(value if is_ident(value) else '"%s"' % value.replace('"', '\\"'))
+            else: assert False, value
+        return '{%s}' % ','.join(result)
+    def JSON_QUERY(builder, expr, path):
+        path_sql, has_params, has_wildcards = builder.build_json_path(path)
+        return '(', builder(expr), " #> ", path_sql, ')'
+    json_value_type_mapping = {bool: 'boolean', int: 'int', float: 'real'}
+    def JSON_VALUE(builder, expr, path, type):
+        if type is ormtypes.Json: return builder.JSON_QUERY(expr, path)
+        path_sql, has_params, has_wildcards = builder.build_json_path(path)
+        sql = '(', builder(expr), " #>> ", path_sql, ')'
+        type_name = builder.json_value_type_mapping.get(type, 'text')
+        return sql if type_name == 'text' else (sql, '::', type_name)
+    def JSON_NONZERO(builder, expr):
+        return 'coalesce(', builder(expr), ", 'null'::jsonb) NOT IN (" \
+               "'null'::jsonb, 'false'::jsonb, '0'::jsonb, '\"\"'::jsonb, '[]'::jsonb, '{}'::jsonb)"
+    def JSON_CONCAT(builder, left, right):
+        return '(', builder(left), '||', builder(right), ')'
+    def JSON_CONTAINS(builder, expr, path, key):
+        return (builder.JSON_QUERY(expr, path) if path else builder(expr)), ' ? ', builder(key)
+    def JSON_ARRAY_LENGTH(builder, value):
+        return 'jsonb_array_length(', builder(value), ')'
 
 class PGStrConverter(dbapiprovider.StrConverter):
-    def py2sql(converter, val):
-        return val.decode(converter.encoding).encode('utf-8')
-    def sql2py(converter, val):
-        if not isinstance(val, unicode):
-            if converter.utf8: return val
-            val = val.decode('utf-8')
-        return val.encode(converter.encoding, 'replace')
+    if PY2:
+        def py2sql(converter, val):
+            return val.encode('utf-8')
+        def sql2py(converter, val):
+            if isinstance(val, unicode): return val
+            return val.decode('utf-8')
 
-class PGLongConverter(dbapiprovider.IntConverter):
-    def sql_type(converter):
-        return 'BIGINT'
+class PGIntConverter(dbapiprovider.IntConverter):
+    signed_types = {None: 'INTEGER', 8: 'SMALLINT', 16: 'SMALLINT', 24: 'INTEGER', 32: 'INTEGER', 64: 'BIGINT'}
+    unsigned_types = {None: 'INTEGER', 8: 'SMALLINT', 16: 'INTEGER', 24: 'INTEGER', 32: 'BIGINT'}
 
 class PGRealConverter(dbapiprovider.RealConverter):
     def sql_type(converter):
@@ -77,6 +130,9 @@ class PGBlobConverter(dbapiprovider.BlobConverter):
     def sql_type(converter):
         return 'BYTEA'
 
+class PGTimedeltaConverter(dbapiprovider.TimedeltaConverter):
+    sql_type_name = 'INTERVAL DAY TO SECOND'
+
 class PGDatetimeConverter(dbapiprovider.DatetimeConverter):
     sql_type_name = 'TIMESTAMP'
 
@@ -84,15 +140,15 @@ class PGUuidConverter(dbapiprovider.UuidConverter):
     def py2sql(converter, val):
         return val
 
+class PGJsonConverter(dbapiprovider.JsonConverter):
+    def sql_type(self):
+        return "JSONB"
+
 class PGPool(Pool):
-    def connect(pool):
-        if pool.con is None:
-            if core.debug: log_orm('GET NEW CONNECTION')
-            pool.con = pool.dbapi_module.connect(*pool.args, **pool.kwargs)
-            if 'client_encoding' not in pool.kwargs:
-                pool.con.set_client_encoding('UTF8')
-        elif core.debug: log_orm('GET CONNECTION FROM THE LOCAL POOL')
-        return pool.con
+    def _connect(pool):
+        pool.con = pool.dbapi_module.connect(*pool.args, **pool.kwargs)
+        if 'client_encoding' not in pool.kwargs:
+            pool.con.set_client_encoding('UTF8')
     def release(pool, con):
         assert con is pool.con
         try:
@@ -118,6 +174,8 @@ class PGProvider(DBAPIProvider):
 
     default_schema_name = 'public'
 
+    fk_types = { 'SERIAL' : 'INTEGER', 'BIGSERIAL' : 'BIGINT' }
+
     def normalize_name(provider, name):
         return name[:provider.max_name_len].lower()
 
@@ -138,22 +196,22 @@ class PGProvider(DBAPIProvider):
         assert not cache.in_transaction
         if cache.immediate and connection.autocommit:
             connection.autocommit = False
-            if core.debug: log_orm('SWITCH FROM AUTOCOMMIT TO TRANSACTION MODE')
+            if core.local.debug: log_orm('SWITCH FROM AUTOCOMMIT TO TRANSACTION MODE')
         db_session = cache.db_session
         if db_session is not None and db_session.serializable:
             cursor = connection.cursor()
             sql = 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE'
-            if core.debug: log_orm(sql)
+            if core.local.debug: log_orm(sql)
             cursor.execute(sql)
         elif not cache.immediate and not connection.autocommit:
             connection.autocommit = True
-            if core.debug: log_orm('SWITCH TO AUTOCOMMIT MODE')
+            if core.local.debug: log_orm('SWITCH TO AUTOCOMMIT MODE')
         if db_session is not None and (db_session.serializable or db_session.ddl):
             cache.in_transaction = True
 
     @wrap_dbapi_exceptions
     def execute(provider, cursor, sql, arguments=None, returning_id=False):
-        if isinstance(sql, unicode): sql = sql.encode('utf8')
+        if PY2 and isinstance(sql, unicode): sql = sql.encode('utf8')
         if type(arguments) is list:
             assert arguments and not returning_id
             cursor.executemany(sql, arguments)
@@ -172,7 +230,7 @@ class PGProvider(DBAPIProvider):
         cursor.execute(sql, (schema_name, table_name))
         row = cursor.fetchone()
         return row[0] if row is not None else None
-    
+
     def index_exists(provider, connection, table_name, index_name, case_sensitive=True):
         schema_name, table_name = provider.split_table_name(table_name)
         cursor = connection.cursor()
@@ -214,17 +272,19 @@ class PGProvider(DBAPIProvider):
         cursor.execute(sql)
 
     converter_classes = [
+        (NoneType, dbapiprovider.NoneConverter),
         (bool, dbapiprovider.BoolConverter),
-        (unicode, PGUnicodeConverter),
-        (str, PGStrConverter),
-        (long, PGLongConverter),
-        (int, dbapiprovider.IntConverter),
+        (basestring, PGStrConverter),
+        (int_types, PGIntConverter),
         (float, PGRealConverter),
         (Decimal, dbapiprovider.DecimalConverter),
-        (buffer, PGBlobConverter),
         (datetime, PGDatetimeConverter),
         (date, dbapiprovider.DateConverter),
+        (time, dbapiprovider.TimeConverter),
+        (timedelta, PGTimedeltaConverter),
         (UUID, PGUuidConverter),
+        (buffer, PGBlobConverter),
+        (ormtypes.Json, PGJsonConverter),
     ]
 
 provider_cls = PGProvider

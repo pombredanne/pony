@@ -4,8 +4,7 @@ from pony.orm.core import *
 from decimal import Decimal
 from datetime import date
 
-db = Database('sqlite', 'university.sqlite', create_db=True)
-# db = Database('mysql', host='localhost', user='root', passwd='root', db='university')
+db = Database()
 
 class Faculty(db.Entity):
     _table_ = 'Faculties'
@@ -32,7 +31,7 @@ class Group(db.Entity):
 
 class Student(db.Entity):
     _table_ = 'Students'
-    name = Required(unicode)
+    name = Required(str)
     scholarship = Required(Decimal, 10, 2, default=Decimal('0.0'))
     group = Required(Group)
     grades = Set('Grade')
@@ -102,6 +101,11 @@ class Classroom(db.Entity):
     PrimaryKey(building, number)
     description = Optional(str)
     lessons = Set(Lesson)
+
+db.bind('sqlite', 'university2.sqlite', create_db=True)
+#db.bind('mysql', host='localhost', user='pony', passwd='pony', db='university2')
+#db.bind('postgres', user='pony', password='pony', host='localhost', database='university2')
+#db.bind('oracle', 'university2/pony@localhost')
 
 db.generate_mapping(create_tables=True)
 

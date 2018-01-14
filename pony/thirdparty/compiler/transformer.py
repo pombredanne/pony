@@ -25,7 +25,8 @@ parseFile(path) -> AST
 #   http://www.opensource.org/licenses/bsd-license.html
 # and replace OWNER, ORGANIZATION, and YEAR as appropriate.
 
-from __future__ import print_function
+from __future__ import absolute_import, print_function
+from pony.py23compat import PY2, unicode
 
 from .ast import *
 import parser
@@ -37,6 +38,8 @@ if not hasattr(symbol, 'testlist_comp'): symbol.testlist_comp = symbol.testlist_
 if not hasattr(symbol, 'comp_iter'): symbol.comp_iter = symbol.gen_iter
 if not hasattr(symbol, 'comp_for'): symbol.comp_for = symbol.gen_for
 if not hasattr(symbol, 'comp_if'): symbol.comp_if = symbol.gen_if
+
+atom_expr = getattr(symbol, 'atom_expr', None)
 
 class WalkerError(Exception):
     pass
@@ -108,6 +111,15 @@ class Transformer:
         tree = parsefile(fileob | filename)
     """
 
+    def atom_expr(self, nodelist):
+        atom_nodelist = nodelist[0]
+        assert atom_nodelist[0] == symbol.atom, atom_nodelist[0]
+        node = self.atom(atom_nodelist[1:])
+        for i in range(1, len(nodelist)):
+            elt = nodelist[i]
+            node = self.com_apply_trailer(node, elt)
+        return node
+
     def __init__(self):
         self._dispatch = {}
         for value, name in symbol.sym_name.items():
@@ -117,11 +129,16 @@ class Transformer:
         self._atom_dispatch = {token.LPAR: self.atom_lpar,
                                token.LSQB: self.atom_lsqb,
                                token.LBRACE: self.atom_lbrace,
-                               token.BACKQUOTE: self.atom_backquote,
                                token.NUMBER: self.atom_number,
                                token.STRING: self.atom_string,
                                token.NAME: self.atom_name,
                                }
+        if PY2: self._atom_dispatch.update({
+                               token.BACKQUOTE: self.atom_backquote,
+                               })
+        if not PY2: self._atom_dispatch.update({
+            token.ELLIPSIS: self.atom_ellipsis
+        })
         self.encoding = None
 
     def transform(self, tree):
@@ -584,6 +601,12 @@ class Transformer:
         # exprlist: expr (',' expr)* [',']
         return self.com_binary(Tuple, nodelist)
 
+    def testlist_star_expr(self, nodelist):
+        return self.com_binary(Tuple, nodelist)
+
+    def star_expr(self, *args):
+        raise NotImplementedError
+
     testlist_safe = testlist # XXX
     testlist1 = testlist
     exprlist = testlist
@@ -618,6 +641,7 @@ class Transformer:
             return self.lambdef(nodelist[0])
         return self.com_binary(Or, nodelist)
     old_test = or_test
+    test_nocond = old_test
 
     def and_test(self, nodelist):
         # not_test ('and' not_test)*
@@ -764,6 +788,9 @@ class Transformer:
 
     def atom_backquote(self, nodelist):
         return Backquote(self.com_node(nodelist[1]))
+
+    def atom_ellipsis(self, nodelist):
+        return Ellipsis()
 
     def atom_number(self, nodelist):
         ### need to verify this matches compile.c
@@ -1012,7 +1039,8 @@ class Transformer:
         # loop to avoid trivial recursion
         while 1:
             t = node[0]
-            if t in (symbol.exprlist, symbol.testlist, symbol.testlist_safe, symbol.testlist_comp):
+            if t in (symbol.exprlist, symbol.testlist, symbol.testlist_comp) \
+            or PY2 and t == symbol.testlist_safe:
                 if len(node) > 2:
                     return self.com_assign_tuple(node, assigning)
                 node = node[1]
@@ -1021,7 +1049,7 @@ class Transformer:
                     raise SyntaxError("can't assign to operator")
                 node = node[1]
             elif t == symbol.power:
-                if node[1][0] != symbol.atom:
+                if node[1][0] not in (symbol.atom, atom_expr):
                     raise SyntaxError("can't assign to operator")
                 if len(node) > 2:
                     primary = self.com_node(node[1])
@@ -1029,6 +1057,17 @@ class Transformer:
                         ch = node[i]
                         if ch[0] == token.DOUBLESTAR:
                             raise SyntaxError("can't assign to operator")
+                        primary = self.com_apply_trailer(primary, ch)
+                    return self.com_assign_trailer(primary, node[-1],
+                                                   assigning)
+                node = node[1]
+            elif t == atom_expr:
+                if node[1][0] != symbol.atom:
+                    raise SyntaxError("can't assign to operator")
+                if len(node) > 2:
+                    primary = self.com_node(node[1])
+                    for i in range(2, len(node)-1):
+                        ch = node[i]
                         primary = self.com_apply_trailer(primary, ch)
                     return self.com_assign_trailer(primary, node[-1],
                                                    assigning)
@@ -1114,7 +1153,7 @@ class Transformer:
         # listmaker: test ( list_for | (',' test)* [','] )
         values = []
         for i in range(1, len(nodelist)):
-            if nodelist[i][0] == symbol.list_for:
+            if PY2 and nodelist[i][0] == symbol.list_for:
                 assert len(nodelist[i:]) == 1
                 return self.com_list_comprehension(values[0],
                                                    nodelist[i])
@@ -1307,6 +1346,7 @@ class Transformer:
             if star_node:
                 raise SyntaxError("only named arguments may follow *expression")
             return 0, self.com_node(nodelist[1])
+        assert len(nodelist) > 3, [kw, star_node, nodelist]
         result = self.com_node(nodelist[3])
         n = nodelist[1]
         while len(n) == 2 and n[0] != token.NAME:

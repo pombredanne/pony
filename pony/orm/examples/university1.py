@@ -9,18 +9,18 @@ db = Database()
 
 class Department(db.Entity):
     number = PrimaryKey(int, auto=True)
-    name = Required(unicode, unique=True)
+    name = Required(str, unique=True)
     groups = Set("Group")
     courses = Set("Course")
 
 class Group(db.Entity):
     number = PrimaryKey(int)
-    major = Required(unicode)
+    major = Required(str)
     dept = Required("Department")
     students = Set("Student")
 
 class Course(db.Entity):
-    name = Required(unicode)
+    name = Required(str)
     semester = Required(int)
     lect_hours = Required(int)
     lab_hours = Required(int)
@@ -32,7 +32,7 @@ class Course(db.Entity):
 class Student(db.Entity):
     # _table_ = "public", "Students"  # Schema support
     id = PrimaryKey(int, auto=True)
-    name = Required(unicode)
+    name = Required(str)
     dob = Required(date)
     tel = Optional(str)
     picture = Optional(buffer, lazy=True)
@@ -42,10 +42,13 @@ class Student(db.Entity):
 
 sql_debug(True)  # Output all SQL queries to stdout
 
-db.bind('sqlite', 'presentation.sqlite', create_db=True)
-#db.bind('mysql', host="localhost", user="presentation", passwd="pony", db="presentation")
-#db.bind('postgres', user='presentation', password='pony', host='localhost', database='presentation')
-#db.bind('oracle', 'presentation/pony@localhost')
+params = dict(
+    sqlite=dict(provider='sqlite', filename='university1.sqlite', create_db=True),
+    mysql=dict(provider='mysql', host="localhost", user="pony", passwd="pony", db="pony"),
+    postgres=dict(provider='postgres', user='pony', password='pony', host='localhost', database='pony'),
+    oracle=dict(provider='oracle', user='c##pony', password='pony', dsn='localhost/orcl')
+)
+db.bind(**params['sqlite'])
 
 db.generate_mapping(create_tables=True)
 

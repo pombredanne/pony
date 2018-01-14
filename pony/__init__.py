@@ -3,7 +3,7 @@ from __future__ import absolute_import, print_function
 import sys
 from os.path import dirname
 
-__version__ = '0.5.4-dev'
+__version__ = '0.7.4-dev'
 
 def detect_mode():
     try: import google.appengine
@@ -18,6 +18,8 @@ def detect_mode():
     else: return 'MOD_WSGI'
 
     if 'flup.server.fcgi' in sys.modules: return 'FCGI-FLUP'
+
+    if 'uwsgi' in sys.modules: return 'UWSGI'
 
     try: sys.modules['__main__'].__file__
     except AttributeError:  return 'INTERACTIVE'

@@ -1,10 +1,11 @@
 from __future__ import absolute_import, print_function, division
+from pony.py23compat import basestring
 
 from functools import update_wrapper
 
 from pony.thirdparty.compiler import ast
 
-from pony.utils import throw
+from pony.utils import throw, copy_ast
 
 class TranslationError(Exception): pass
 
@@ -76,6 +77,8 @@ class PythonTranslator(ASTTranslator):
         return src
     def postGenExprIf(translator, node):
         return 'if %s' % node.test.src
+    def postIfExp(translator, node):
+        return '%s if %s else %s' % (node.then.src, node.test.src, node.else_.src)
     @priority(14)
     def postOr(translator, node):
         return ' or '.join(expr.src for expr in node.nodes)
@@ -171,6 +174,8 @@ class PythonTranslator(ASTTranslator):
             s = str(value)
             if float(s) == value: return s
         return repr(value)
+    def postEllipsis(translator, node):
+        return '...'
     def postList(translator, node):
         node.priority = 1
         return '[%s]' % ', '.join(item.src for item in node.nodes)
@@ -203,26 +208,35 @@ class PythonTranslator(ASTTranslator):
 nonexternalizable_types = (ast.Keyword, ast.Sliceobj, ast.List, ast.Tuple)
 
 class PreTranslator(ASTTranslator):
-    def __init__(translator, tree, additional_internal_names=()):
+    def __init__(translator, tree, globals, locals,
+                 special_functions, const_functions, additional_internal_names=()):
         ASTTranslator.__init__(translator, tree)
-        translator.additional_internal_names = additional_internal_names
+        translator.getattr_nodes = set()
+        translator.globals = globals
+        translator.locals = locals
+        translator.special_functions = special_functions
+        translator.const_functions = const_functions
         translator.contexts = []
+        if additional_internal_names:
+            translator.contexts.append(additional_internal_names)
         translator.externals = externals = set()
         translator.dispatch(tree)
         for node in externals.copy():
-            if isinstance(node, nonexternalizable_types):
+            if isinstance(node, nonexternalizable_types) \
+            or node.constant and not isinstance(node, ast.Const):
                 node.external = False
                 externals.remove(node)
-                externals.update(node.getChildNodes())
+                externals.update(node for node in node.getChildNodes() if node.external and not node.constant)
     def dispatch(translator, node):
-        node.external = node.constant = False
+        node.external = node.constant = None
         ASTTranslator.dispatch(translator, node)
-        childs = node.getChildNodes()
-        if childs and all(getattr(child, 'external', False) for child in childs):
+        children = node.getChildNodes()
+        if node.external is None and children and all(
+                getattr(child, 'external', False) and not getattr(child, 'raw_sql', False) for child in children):
             node.external = True
         if node.external and not node.constant:
             externals = translator.externals
-            externals.difference_update(childs)
+            externals.difference_update(children)
             externals.add(node)
     def preGenExprInner(translator, node):
         translator.contexts.append(set())
@@ -249,23 +263,89 @@ class PreTranslator(ASTTranslator):
         name = node.name
         for context in translator.contexts:
             if name in context: return
-        if name in ('count', 'random'): return
-        node.external = name not in translator.additional_internal_names
+        node.external = True
     def postConst(translator, node):
         node.external = node.constant = True
+    def postDict(translator, node):
+        node.external = True
+    def postList(translator, node):
+        node.external = True
+    def postKeyword(translator, node):
+        node.constant = node.expr.constant
+    def postCallFunc(translator, node):
+        func_node = node.node
+        if not func_node.external: return
+        attrs = []
+        while isinstance(func_node, ast.Getattr):
+            attrs.append(func_node.attrname)
+            func_node = func_node.expr
+        if not isinstance(func_node, ast.Name): return
+        attrs.append(func_node.name)
+        expr = '.'.join(reversed(attrs))
+        x = eval(expr, translator.globals, translator.locals)
+        try: hash(x)
+        except TypeError: pass
+        else:
+            if x in translator.special_functions:
+                if x.__name__ == 'raw_sql': node.raw_sql = True
+                elif x is getattr:
+                    attr_node = node.args[1]
+                    attr_node.parent_node = node
+                    translator.getattr_nodes.add(attr_node)
+                else: node.external = False
+            elif x in translator.const_functions:
+                for arg in node.args:
+                    if not arg.constant: return
+                if node.star_args is not None and not node.star_args.constant: return
+                if node.dstar_args is not None and not node.dstar_args.constant: return
+                node.constant = True
 
+getattr_cache = {}
 extractors_cache = {}
 
-def create_extractors(code_key, tree, filter_num, additional_internal_names=()):
-    result = extractors_cache.get(code_key)
-    if result is None:
-        pretranslator = PreTranslator(tree, additional_internal_names)
+def create_extractors(code_key, tree, globals, locals, special_functions, const_functions, additional_internal_names=()):
+    result = None
+    getattr_extractors = getattr_cache.get(code_key)
+    if getattr_extractors:
+        getattr_attrname_values = tuple(eval(code, globals, locals) for src, code in getattr_extractors)
+        extractors_key = (code_key, getattr_attrname_values)
+        try:
+            result = extractors_cache.get(extractors_key)
+        except TypeError:
+            pass # unhashable type
+        if not result:
+            tree = copy_ast(tree)
+
+    if not result:
+        pretranslator = PreTranslator(
+            tree, globals, locals, special_functions, const_functions, additional_internal_names)
+
         extractors = {}
         for node in pretranslator.externals:
             src = node.src = ast2src(node)
             if src == '.0': code = None
             else: code = compile(src, src, 'eval')
-            extractors[filter_num, src] = code
+            extractors[src] = code
+
+        getattr_extractors = {}
+        getattr_attrname_dict = {}
+        for node in pretranslator.getattr_nodes:
+            if node in pretranslator.externals:
+                src = node.src
+                code = extractors[src]
+                getattr_extractors[src] = code
+                attrname_value = eval(code, globals, locals)
+                getattr_attrname_dict[src] = attrname_value
+            elif isinstance(node, ast.Const):
+                attrname_value = node.value
+            else: throw(TypeError, '`%s` should be either external expression or constant.' % ast2src(node))
+            if not isinstance(attrname_value, basestring): throw(TypeError,
+                '%s: attribute name must be string. Got: %r' % (ast2src(node.parent_node), attrname_value))
+            node._attrname_value = attrname_value
+        getattr_cache[code_key] = tuple(sorted(getattr_extractors.items()))
+
         varnames = list(sorted(extractors))
-        result = extractors_cache[code_key] = extractors, varnames, tree
+        getattr_attrname_values = tuple(val for key, val in sorted(getattr_attrname_dict.items()))
+        extractors_key = (code_key, getattr_attrname_values)
+        result = extractors_cache[extractors_key] = extractors, varnames, tree, extractors_key
     return result

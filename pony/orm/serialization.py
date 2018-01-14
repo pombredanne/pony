@@ -41,7 +41,7 @@ class Bag(object):
         cache = bag.session_cache
         if cache is None: cache = bag.session_cache = obj._session_cache_
         elif obj._session_cache_ is not cache: throw(TransactionError,
-            'An attempt to mix objects belongs to different caches')
+            'An attempt to mix objects belonging to different transactions')
         bag.objects[entity].add(obj)
     def _reduce_composite_pk(bag, pk):
         return ','.join(str(item).replace('*', '**').replace(',', '*,') for item in pk)
@@ -81,15 +81,16 @@ class Bag(object):
                     value = sorted(bag._reduce_composite_pk(item._get_raw_pkval_()) for item in value)
                 else: value = sorted(item._get_raw_pkval_()[0] for item in value)
             elif attr.is_relation:
-                if process_related_objects:
-                    bag._process_object(value, process_related=False)
-                value = value._get_raw_pkval_()
-                if len(value) == 1: value = value[0]
+                if value is not None:
+                    if process_related_objects:
+                        bag._process_object(value, process_related=False)
+                    value = value._get_raw_pkval_()
+                    if len(value) == 1: value = value[0]
             d[attr.name] = value
         bag.dicts[entity][obj] = d
     @cut_traceback
     def to_json(bag):
-        return json.dumps(result, default=json_converter, indent=2, sort_keys=True)
+        return json.dumps(bag.to_dict(), default=json_converter, indent=2, sort_keys=True)
 
 def to_dict(objects):
     if isinstance(objects, Entity): objects = [ objects ]
@@ -102,7 +103,7 @@ def to_dict(objects):
     bag = Bag(database)
     bag.put(first_object)
     bag.put(objects)
-    return bag.to_dict()
+    return dict(bag.to_dict())
 
 def to_json(objects):
     return json.dumps(to_dict(objects), default=json_converter, indent=2, sort_keys=True)

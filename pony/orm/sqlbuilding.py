@@ -1,5 +1,5 @@
 from __future__ import absolute_import, print_function, division
-from pony.py23compat import izip, imap, itervalues
+from pony.py23compat import PY2, izip, imap, itervalues, basestring, unicode, buffer
 
 from operator import attrgetter
 from decimal import Decimal
@@ -7,17 +7,36 @@ from datetime import date, datetime
 from binascii import hexlify
 
 from pony import options
-from pony.utils import datetime2timestamp, throw
+from pony.utils import datetime2timestamp, throw, is_ident
+from pony.orm.ormtypes import RawSQL, Json
 
 class AstError(Exception): pass
 
 class Param(object):
-    __slots__ = 'style', 'id', 'paramkey', 'py2sql'
-    def __init__(param, paramstyle, id, paramkey, converter=None):
+    __slots__ = 'style', 'id', 'paramkey', 'converter', 'optimistic'
+    def __init__(param, paramstyle, paramkey, converter=None, optimistic=False):
         param.style = paramstyle
-        param.id = id
+        param.id = None
         param.paramkey = paramkey
-        param.py2sql = converter.py2sql if converter else (lambda val: val)
+        param.converter = converter
+        param.optimistic = optimistic
+    def eval(param, values):
+        varkey, i, j = param.paramkey
+        value = values[varkey]
+        t = type(value)
+        if i is not None:
+            if t is tuple: value = value[i]
+            elif t is RawSQL: value = value.values[i]
+            else: assert False
+        if j is not None:
+            assert type(type(value)).__name__ == 'EntityMeta'
+            value = value._get_raw_pkval_()[j]
+        converter = param.converter
+        if value is not None and converter is not None:
+            if converter.attr is None:
+                value = converter.val2dbval(value)
+            value = converter.py2sql(value)
+        return value
     def __unicode__(param):
         paramstyle = param.style
         if paramstyle == 'qmark': return u'?'
@@ -26,8 +45,20 @@ class Param(object):
         elif paramstyle == 'named': return u':p%d' % param.id
         elif paramstyle == 'pyformat': return u'%%(p%d)s' % param.id
         else: throw(NotImplementedError)
+    if not PY2: __str__ = __unicode__
     def __repr__(param):
         return '%s(%r)' % (param.__class__.__name__, param.paramkey)
+
+class CompositeParam(Param):
+    __slots__ = 'items', 'func'
+    def __init__(param, paramstyle, paramkey, items, func):
+        for item in items: assert isinstance(item, (Param, Value)), item
+        Param.__init__(param, paramstyle, paramkey)
+        param.items = items
+        param.func = func
+    def eval(param, values):
+        args = [ item.eval(values) if isinstance(item, Param) else item.value for item in param.items ]
+        return param.func(args)
 
 class Value(object):
     __slots__ = 'paramstyle', 'value'
@@ -38,12 +69,17 @@ class Value(object):
         value = self.value
         if value is None: return 'null'
         if isinstance(value, bool): return value and '1' or '0'
-        if isinstance(value, (int, long, float, Decimal)): return str(value)
         if isinstance(value, basestring): return self.quote_str(value)
         if isinstance(value, datetime): return self.quote_str(datetime2timestamp(value))
         if isinstance(value, date): return self.quote_str(str(value))
-        if isinstance(value, buffer): return "X'%s'" % hexlify(value)
-        assert False, value
+        if PY2:
+            if isinstance(value, (int, long, float, Decimal)): return str(value)
+            if isinstance(value, buffer): return "X'%s'" % hexlify(value)
+        else:
+            if isinstance(value, (int, float, Decimal)): return str(value)
+            if isinstance(value, bytes): return "X'%s'" % hexlify(value).decode('ascii')
+        assert False, value  # pragma: no cover
+    if not PY2: __str__ = __unicode__
     def __repr__(self):
         return '%s(%r)' % (self.__class__.__name__, self.value)
     def quote_str(self, s):
@@ -120,24 +156,11 @@ def indentable(method):
     new_method.__name__ = method.__name__
     return new_method
 
-def convert(values, params):
-    for param in params:
-        varkey, i, j = param.paramkey
-        value = values[varkey]
-        if i is not None:
-            assert type(value) is tuple
-            value = value[i]
-        if j is not None:
-            assert type(type(value)).__name__ == 'EntityMeta'
-            value = value._get_raw_pkval_()[j]
-        if value is not None:  # can value be None at all?
-            value = param.py2sql(value)
-        yield value
-
 class SQLBuilder(object):
     dialect = None
-    make_param = Param
-    make_value = Value
+    param_class = Param
+    composite_param_class = CompositeParam
+    value_class = Value
     indent_spaces = " " * 4
     def __init__(builder, provider, ast):
         builder.provider = provider
@@ -147,23 +170,26 @@ class SQLBuilder(object):
         builder.indent = 0
         builder.keys = {}
         builder.inner_join_syntax = options.INNER_JOIN_SYNTAX
+        builder.suppress_aliases = False
         builder.result = flat(builder(ast))
+        params = tuple(x for x in builder.result if isinstance(x, Param))
+        layout = []
+        for i, param in enumerate(params):
+            if param.id is None: param.id = i + 1
+            layout.append(param.paramkey)
+        builder.layout = layout
         builder.sql = u''.join(imap(unicode, builder.result)).rstrip('\n')
         if paramstyle in ('qmark', 'format'):
-            params = tuple(x for x in builder.result if isinstance(x, Param))
             def adapter(values):
-                return tuple(convert(values, params))
+                return tuple(param.eval(values) for param in params)
         elif paramstyle == 'numeric':
-            params = tuple(param for param in sorted(itervalues(builder.keys), key=attrgetter('id')))
             def adapter(values):
-                return tuple(convert(values, params))
+                return tuple(param.eval(values) for param in params)
         elif paramstyle in ('named', 'pyformat'):
-            params = tuple(param for param in sorted(itervalues(builder.keys), key=attrgetter('id')))
             def adapter(values):
-                return dict(('p%d' % param.id, value) for param, value in izip(params, convert(values, params)))
+                return {'p%d' % param.id: param.eval(values) for param in params}
         else: throw(NotImplementedError, paramstyle)
         builder.params = params
-        builder.layout = tuple(param.paramkey for param in params)
         builder.adapter = adapter
     def __call__(builder, ast):
         if isinstance(ast, basestring):
@@ -195,10 +221,18 @@ class SQLBuilder(object):
         return [ 'UPDATE ', builder.quote_name(table_name), '\nSET ',
                  join(', ', [ (builder.quote_name(name), ' = ', builder(param)) for name, param in pairs]),
                  where and [ '\n', builder(where) ] or [] ]
-    def DELETE(builder, table_name, where=None):
-        result = [ 'DELETE FROM ', builder.quote_name(table_name) ]
-        if where: result += [ '\n', builder(where) ]
-        return result
+    def DELETE(builder, alias, from_ast, where=None):
+        builder.indent += 1
+        if alias is not None:
+            assert isinstance(alias, basestring)
+            if not where: return 'DELETE ', alias, ' ', builder(from_ast)
+            return 'DELETE ', alias, ' ', builder(from_ast), builder(where)
+        else:
+            assert from_ast[0] == 'FROM' and len(from_ast) == 2 and from_ast[1][1] == 'TABLE'
+            alias = from_ast[1][0]
+            if alias is not None: builder.suppress_aliases = True
+            if not where: return 'DELETE ', builder(from_ast)
+            return 'DELETE ', builder(from_ast), builder(where)
     def subquery(builder, *sections):
         builder.indent += 1
         if not builder.inner_join_syntax:
@@ -207,11 +241,16 @@ class SQLBuilder(object):
         builder.indent -= 1
         return result
     def SELECT(builder, *sections):
-        result = builder.subquery(*sections)
-        if builder.indent:
-            indent = builder.indent_spaces * builder.indent
-            return '(\n', result, indent + ')'
-        return result
+        prev_suppress_aliases = builder.suppress_aliases
+        builder.suppress_aliases = False
+        try:
+            result = builder.subquery(*sections)
+            if builder.indent:
+                indent = builder.indent_spaces * builder.indent
+                return '(\n', result, indent + ')'
+            return result
+        finally:
+            builder.suppress_aliases = prev_suppress_aliases
     def SELECT_FOR_UPDATE(builder, nowait, *sections):
         assert not builder.indent
         result = builder.SELECT(*sections)
@@ -253,7 +292,8 @@ class SQLBuilder(object):
             if i > 0:
                 if join_cond is None: result.append(', ')
                 else: result += [ '\n', indent, '  %s JOIN ' % join_type ]
-            if alias is not None: alias = builder.quote_name(alias)
+            if builder.suppress_aliases: alias = None
+            elif alias is not None: alias = builder.quote_name(alias)
             if kind == 'TABLE':
                 if isinstance(x, basestring): result.append(builder.quote_name(x))
                 else: result.append(builder.compound_name(x))
@@ -319,19 +359,24 @@ class SQLBuilder(object):
         if not offset: return 'LIMIT ', builder(limit), '\n'
         else: return 'LIMIT ', builder(limit), ' OFFSET ', builder(offset), '\n'
     def COLUMN(builder, table_alias, col_name):
-        if table_alias: return [ '%s.%s' % (builder.quote_name(table_alias), builder.quote_name(col_name)) ]
-        else: return [ '%s' % (builder.quote_name(col_name)) ]
-    def PARAM(builder, paramkey, converter=None):
+        if builder.suppress_aliases or not table_alias:
+            return [ '%s' % builder.quote_name(col_name) ]
+        return [ '%s.%s' % (builder.quote_name(table_alias), builder.quote_name(col_name)) ]
+    def PARAM(builder, paramkey, converter=None, optimistic=False):
+        return builder.make_param(builder.param_class, paramkey, converter, optimistic)
+    def make_param(builder, param_class, paramkey, *args):
         keys = builder.keys
         param = keys.get(paramkey)
         if param is None:
-            param = Param(builder.paramstyle, len(keys) + 1, paramkey, converter)
+            param = param_class(builder.paramstyle, paramkey, *args)
             keys[paramkey] = param
-        return [ param ]
+        return param
+    def make_composite_param(builder, paramkey, items, func):
+        return builder.make_param(builder.composite_param_class, paramkey, items, func)
     def ROW(builder, *items):
         return '(', join(', ', imap(builder, items)), ')'
     def VALUE(builder, value):
-        return [ builder.make_value(builder.paramstyle, value) ]
+        return builder.value_class(builder.paramstyle, value)
     def AND(builder, *cond_list):
         cond_list = [ builder(condition) for condition in cond_list ]
         return join(' AND ', cond_list)
@@ -355,6 +400,15 @@ class SQLBuilder(object):
     DIV = make_binary_op(' / ', True)
     FLOORDIV = make_binary_op(' / ', True)
 
+    def MOD(builder, a, b):
+        symbol = ' %% ' if builder.paramstyle in ('format', 'pyformat') else ' % '
+        return '(', builder(a), symbol, builder(b), ')'
+    def FLOAT_EQ(builder, a, b):
+        a, b = builder(a), builder(b)
+        return 'abs(', a, ' - ', b, ') / coalesce(nullif(greatest(abs(', a, '), abs(', b, ')), 0), 1) <= 1e-14'
+    def FLOAT_NE(builder, a, b):
+        a, b = builder(a), builder(b)
+        return 'abs(', a, ' - ', b, ') / coalesce(nullif(greatest(abs(', a, '), abs(', b, ')), 0), 1) > 1e-14'
     def CONCAT(builder, *args):
         return '(',  join(' || ', imap(builder, args)), ')'
     def NEG(builder, expr):
@@ -382,7 +436,7 @@ class SQLBuilder(object):
         expr_list = [ builder(expr) for expr in x ]
         return builder(expr1), ' IN (', join(', ', expr_list), ')'
     def NOT_IN(builder, expr1, x):
-        if not x: throw(AstError, 'Empty IN clause')
+        if not x: return '1 = 1'
         if len(x) >= 1 and x[0] == 'SELECT':
             return builder(expr1), ' NOT IN ', builder(x)
         expr_list = [ builder(expr) for expr in x ]
@@ -410,15 +464,15 @@ class SQLBuilder(object):
     LENGTH = make_unary_func('length')
     ABS = make_unary_func('abs')
     def COALESCE(builder, *args):
-        if len(args) < 2: assert False
+        if len(args) < 2: assert False  # pragma: no cover
         return 'coalesce(', join(', ', imap(builder, args)), ')'
     def MIN(builder, *args):
-        if len(args) == 0: assert False
+        if len(args) == 0: assert False  # pragma: no cover
         elif len(args) == 1: fname = 'MIN'
         else: fname = 'least'
         return fname, '(',  join(', ', imap(builder, args)), ')'
     def MAX(builder, *args):
-        if len(args) == 0: assert False
+        if len(args) == 0: assert False  # pragma: no cover
         elif len(args) == 1: fname = 'MAX'
         else: fname = 'greatest'
         return fname, '(',  join(', ', imap(builder, args)), ')'
@@ -426,6 +480,9 @@ class SQLBuilder(object):
         if len is None: return 'substr(', builder(expr), ', ', builder(start), ')'
         return 'substr(', builder(expr), ', ', builder(start), ', ', builder(len), ')'
     def CASE(builder, expr, cases, default=None):
+        if expr is None and default is not None and default[0] == 'CASE' and default[1] is None:
+            cases2, default2 = default[2:]
+            return builder.CASE(None, tuple(cases) + tuple(cases2), default2)
         result = [ 'case' ]
         if expr is not None:
             result.append(' ')
@@ -469,3 +526,55 @@ class SQLBuilder(object):
         return 'EXTRACT(SECOND FROM ', builder(expr), ')'
     def RANDOM(builder):
         return 'RAND()'
+    def RAWSQL(builder, sql):
+        if isinstance(sql, basestring): return sql
+        return [ x if isinstance(x, basestring) else builder(x) for x in sql ]
+    def build_json_path(builder, path):
+        empty_slice = slice(None, None, None)
+        has_params = False
+        has_wildcards = False
+        items = [ builder(element) for element in path ]
+        for item in items:
+            if isinstance(item, Param):
+                has_params = True
+            elif isinstance(item, Value):
+                value = item.value
+                if value is Ellipsis or value == empty_slice: has_wildcards = True
+                else: assert isinstance(value, (int, basestring)), value
+            else: assert False, item
+        if has_params:
+            paramkey = tuple(item.paramkey if isinstance(item, Param) else
+                             None if type(item.value) is slice else item.value
+                             for item in items)
+            path_sql = builder.make_composite_param(paramkey, items, builder.eval_json_path)
+        else:
+            result_value = builder.eval_json_path(item.value for item in items)
+            path_sql = builder.value_class(builder.paramstyle, result_value)
+        return path_sql, has_params, has_wildcards
+    @classmethod
+    def eval_json_path(cls, values):
+        result = ['$']
+        append = result.append
+        empty_slice = slice(None, None, None)
+        for value in values:
+            if isinstance(value, int): append('[%d]' % value)
+            elif isinstance(value, basestring):
+                append('.' + value if is_ident(value) else '."%s"' % value.replace('"', '\\"'))
+            elif value is Ellipsis: append('.*')
+            elif value == empty_slice: append('[*]')
+            else: assert False, value
+        return ''.join(result)
+    def JSON_QUERY(builder, expr, path):
+        throw(NotImplementedError)
+    def JSON_VALUE(builder, expr, path, type):
+        throw(NotImplementedError)
+    def JSON_NONZERO(builder, expr):
+        throw(NotImplementedError)
+    def JSON_CONCAT(builder, left, right):
+        throw(NotImplementedError)
+    def JSON_CONTAINS(builder, expr, path, key):
+        throw(NotImplementedError)
+    def JSON_ARRAY_LENGTH(builder, value):
+        throw(NotImplementedError)
+    def JSON_PARAM(builder, expr):
+        return builder(expr)

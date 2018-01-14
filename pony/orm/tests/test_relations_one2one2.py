@@ -24,12 +24,12 @@ class TestOneToOne2(unittest.TestCase):
             db.execute('update male set wife=null')
             db.execute('delete from male')
             db.execute('delete from female')
-            db.insert('female', id=1, name='F1')
-            db.insert('female', id=2, name='F2')
-            db.insert('female', id=3, name='F3')
-            db.insert('male', id=1, name='M1', wife=1)
-            db.insert('male', id=2, name='M2', wife=2)
-            db.insert('male', id=3, name='M3', wife=None)
+            db.insert(Female, id=1, name='F1')
+            db.insert(Female, id=2, name='F2')
+            db.insert(Female, id=3, name='F3')
+            db.insert(Male, id=1, name='M1', wife=1)
+            db.insert(Male, id=2, name='M2', wife=2)
+            db.insert(Male, id=3, name='M3', wife=None)
             db.execute('update female set husband=1 where id=1')
             db.execute('update female set husband=2 where id=2')
         db_session.__enter__()
@@ -121,7 +121,8 @@ class TestOneToOne2(unittest.TestCase):
         self.assertEqual([2, None, None], wives)
         husbands = db.select('husband from female order by female.id')
         self.assertEqual([None, 1, None], husbands)
-    @raises_exception(UnrepeatableReadError, 'Value of Male.wife for Male[1] was updated outside of current transaction')
+    @raises_exception(UnrepeatableReadError, 'Multiple Male objects linked with the same Female[1] object. '
+                                             'Maybe Female.husband attribute should be Set instead of Optional')
     def test_9(self):
         db.execute('update female set husband = 3 where id = 1')
         m1 = Male[1]
@@ -132,7 +133,7 @@ class TestOneToOne2(unittest.TestCase):
         m1 = Male[1]
         f1 = Female[1]
         f1.name
-        self.assert_(Male.wife not in m1._vals_)
+        self.assertTrue(Male.wife not in m1._vals_)
 
 
 if __name__ == '__main__':

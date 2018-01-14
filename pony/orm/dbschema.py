@@ -1,8 +1,10 @@
 from __future__ import absolute_import, print_function, division
-from pony.py23compat import itervalues
+from pony.py23compat import itervalues, basestring
+
+from operator import attrgetter
 
 from pony.orm import core
-from pony.orm.core import log_sql, DBSchemaError
+from pony.orm.core import log_sql, DBSchemaError, MappingError
 from pony.utils import throw
 
 class DBSchema(object):
@@ -24,12 +26,13 @@ class DBSchema(object):
         if schema.uppercase: return s.upper().replace('%S', '%s') \
             .replace(')S', ')s').replace('%R', '%r').replace(')R', ')r')
         else: return s.lower()
-    def add_table(schema, table_name):
-        return schema.table_class(table_name, schema)
+    def add_table(schema, table_name, entity=None):
+        return schema.table_class(table_name, schema, entity)
     def order_tables_to_create(schema):
         tables = []
         created_tables = set()
-        tables_to_create = sorted(itervalues(schema.tables), key=lambda table: table.name)
+        split = schema.provider.split_table_name
+        tables_to_create = sorted(itervalues(schema.tables), key=lambda table: split(table.name))
         while tables_to_create:
             for table in tables_to_create:
                 if table.parent_tables.issubset(created_tables):
@@ -61,29 +64,28 @@ class DBSchema(object):
                                          'Try to delete %s %s first.' % (tn1, n1, tn2, n2, n2, tn2))
     def check_tables(schema, provider, connection):
         cursor = connection.cursor()
-        for table in sorted(itervalues(schema.tables), key=lambda table: table.name):
-            if isinstance(table.name, tuple): alias = table.name[-1]
-            elif isinstance(table.name, basestring): alias = table.name
-            else: assert False
+        split = provider.split_table_name
+        for table in sorted(itervalues(schema.tables), key=lambda table: split(table.name)):
+            alias = provider.base_name(table.name)
             sql_ast = [ 'SELECT',
                         [ 'ALL', ] + [ [ 'COLUMN', alias, column.name ] for column in table.column_list ],
                         [ 'FROM', [ alias, 'TABLE', table.name ] ],
                         [ 'WHERE', [ 'EQ', [ 'VALUE', 0 ], [ 'VALUE', 1 ] ] ]
                       ]
             sql, adapter = provider.ast2sql(sql_ast)
-            if core.debug: log_sql(sql)
+            if core.local.debug: log_sql(sql)
             provider.execute(cursor, sql)
 
 class DBObject(object):
     def create(table, provider, connection):
         sql = table.get_create_command()
-        if core.debug: log_sql(sql)
+        if core.local.debug: log_sql(sql)
         cursor = connection.cursor()
         provider.execute(cursor, sql)
 
 class Table(DBObject):
     typename = 'Table'
-    def __init__(table, name, schema):
+    def __init__(table, name, schema, entity=None):
         if name in schema.tables:
             throw(DBSchemaError, "Table %r already exists in database schema" % name)
         if name in schema.names:
@@ -100,12 +102,24 @@ class Table(DBObject):
         table.parent_tables = set()
         table.child_tables = set()
         table.entities = set()
+        table.options = {}
+        if entity is not None:
+            table.entities.add(entity)
+            table.options = entity._table_options_
         table.m2m = set()
     def __repr__(table):
         table_name = table.name
         if isinstance(table_name, tuple):
             table_name = '.'.join(table_name)
         return '<Table(%s)>' % table_name
+    def add_entity(table, entity):
+        for e in table.entities:
+            if e._root_ is not entity._root_:
+                throw(MappingError, "Entities %s and %s cannot be mapped to table %s "
+                                   "because they don't belong to the same hierarchy"
+                                   % (e, entity, table.name))
+        assert '_table_options_' not in entity.__dict__
+        table.entities.add(entity)
     def exists(table, provider, connection, case_sensitive=True):
         return provider.table_exists(connection, table.name, case_sensitive)
     def get_create_command(table):
@@ -121,25 +135,35 @@ class Table(DBObject):
             cmd.append(schema.indent + column.get_sql() + ',')
         if len(table.pk_index.columns) > 1:
             cmd.append(schema.indent + table.pk_index.get_sql() + ',')
-        for index in sorted(itervalues(table.indexes), key=lambda index: index.name):
-            if index.is_pk: continue
-            if not index.is_unique: continue
-            if len(index.columns) == 1: continue
-            cmd.append(schema.indent+index.get_sql() + ',')
+        indexes = [ index for index in itervalues(table.indexes)
+                    if not index.is_pk and index.is_unique and len(index.columns) > 1 ]
+        for index in indexes: assert index.name is not None
+        indexes.sort(key=attrgetter('name'))
+        for index in indexes: cmd.append(schema.indent+index.get_sql() + ',')
         if not schema.named_foreign_keys:
             for foreign_key in sorted(itervalues(table.foreign_keys), key=lambda fk: fk.name):
                 if schema.inline_fk_syntax and len(foreign_key.child_columns) == 1: continue
                 cmd.append(schema.indent+foreign_key.get_sql() + ',')
         cmd[-1] = cmd[-1][:-1]
         cmd.append(')')
+        for name, value in sorted(table.options.items()):
+            option = table.format_option(name, value)
+            if option: cmd.append(option)
         return '\n'.join(cmd)
+    def format_option(table, name, value):
+        if value is True:
+            return name
+        if value is False:
+            return None
+        return '%s %s' % (name, value)
     def get_objects_to_create(table, created_tables=None):
         if created_tables is None: created_tables = set()
+        created_tables.add(table)
         result = [ table ]
-        for index in sorted(itervalues(table.indexes), key=lambda index: index.name):
-            if index.is_pk or index.is_unique: continue
-            assert index.name is not None
-            result.append(index)
+        indexes = [ index for index in itervalues(table.indexes) if not index.is_pk and not index.is_unique ]
+        for index in indexes: assert index.name is not None
+        indexes.sort(key=attrgetter('name'))
+        result.extend(indexes)
         schema = table.schema
         if schema.named_foreign_keys:
             for foreign_key in sorted(itervalues(table.foreign_keys), key=lambda fk: fk.name):
@@ -150,7 +174,6 @@ class Table(DBObject):
                 for foreign_key in sorted(itervalues(child_table.foreign_keys), key=lambda fk: fk.name):
                     if foreign_key.parent_table is not table: continue
                     result.append(foreign_key)
-        created_tables.add(table)
         return result
     def add_column(table, column_name, sql_type, converter, is_not_null=None, sql_default=None):
         return table.schema.column_class(column_name, table, sql_type, converter, is_not_null, sql_default)
@@ -231,7 +254,7 @@ class Constraint(DBObject):
         constraint.schema = schema
         constraint.name = name
 
-class Index(Constraint):
+class DBIndex(Constraint):
     typename = 'Index'
     def __init__(index, name, table, columns, is_pk=False, is_unique=None):
         assert len(columns) > 0
@@ -252,12 +275,12 @@ class Index(Constraint):
         elif is_unique is None: is_unique = False
         schema = table.schema
         if name is not None and name in schema.names:
-            throw(DBSchemaError, 'Index %s cannot be created, name is already in use')
+            throw(DBSchemaError, 'Index %s cannot be created, name is already in use' % name)
         Constraint.__init__(index, name, schema)
         for column in columns:
-            column.is_pk = len(columns) == 1 and is_pk
-            column.is_pk_part = bool(is_pk)
-            column.is_unique = is_unique and len(columns) == 1
+            column.is_pk = column.is_pk or (len(columns) == 1 and is_pk)
+            column.is_pk_part = column.is_pk_part or bool(is_pk)
+            column.is_unique = column.is_unique or (is_unique and len(columns) == 1)
         table.indexes[columns] = index
         index.table = table
         index.columns = columns
@@ -327,10 +350,10 @@ class ForeignKey(Constraint):
 
         if index_name is not False:
             child_columns_len = len(child_columns)
-            for columns in child_table.indexes:
-                if columns[:child_columns_len] == child_columns: break
-            else: child_table.add_index(index_name, child_columns, is_pk=False,
-                                        is_unique=False, m2m=bool(child_table.m2m))
+            if all(columns[:child_columns_len] != child_columns for columns in child_table.indexes):
+                child_table.add_index(index_name, child_columns, is_pk=False,
+                                      is_unique=False, m2m=bool(child_table.m2m))
+
     def exists(foreign_key, provider, connection, case_sensitive=True):
         return provider.fk_exists(connection, foreign_key.child_table.name, foreign_key.name, case_sensitive)
     def get_sql(foreign_key):
@@ -359,5 +382,5 @@ class ForeignKey(Constraint):
 
 DBSchema.table_class = Table
 DBSchema.column_class = Column
-DBSchema.index_class = Index
+DBSchema.index_class = DBIndex
 DBSchema.fk_class = ForeignKey

@@ -1,21 +1,48 @@
 from __future__ import absolute_import, print_function, division
+from pony.py23compat import basestring
+
+from functools import wraps
+from contextlib import contextmanager
 
 from pony.orm.core import Database
 from pony.utils import import_module
 
-def raises_exception(exc_class, msg=None):
+def test_exception_msg(test_case, exc_msg, test_msg=None):
+    if test_msg is None: return
+    error_template = "incorrect exception message. expected '%s', got '%s'"
+    assert test_msg not in ('...', '....', '.....', '......')
+    if test_msg.startswith('...'):
+        if test_msg.endswith('...'):
+            test_case.assertIn(test_msg[3:-3], exc_msg, error_template % (test_msg, exc_msg))
+        else:
+            test_case.assertTrue(exc_msg.endswith(test_msg[3:]), error_template % (test_msg, exc_msg))
+    elif test_msg.endswith('...'):
+        test_case.assertTrue(exc_msg.startswith(test_msg[:-3]), error_template % (test_msg, exc_msg))
+    else:
+        test_case.assertEqual(exc_msg, test_msg, error_template % (test_msg, exc_msg))
+
+def raises_exception(exc_class, test_msg=None):
     def decorator(func):
-        def wrapper(self, *args, **kwargs):
+        def wrapper(test_case, *args, **kwargs):
             try:
-                func(self, *args, **kwargs)
-                self.assert_(False, "expected exception %s wasn't raised" % exc_class.__name__)
+                func(test_case, *args, **kwargs)
+                test_case.fail("Expected exception %s wasn't raised" % exc_class.__name__)
             except exc_class as e:
-                if not e.args: self.assertEqual(msg, None)
-                elif msg is not None:
-                    self.assertEqual(e.args[0], msg, "incorrect exception message. expected '%s', got '%s'" % (msg, e.args[0]))
+                if not e.args: test_case.assertEqual(test_msg, None)
+                else: test_exception_msg(test_case, str(e), test_msg)
         wrapper.__name__ = func.__name__
         return wrapper
     return decorator
+
+@contextmanager
+def raises_if(test_case, cond, exc_class, test_msg=None):
+    try:
+        yield
+    except exc_class as e:
+        test_case.assertTrue(cond)
+        test_exception_msg(test_case, str(e), test_msg)
+    else:
+        test_case.assertFalse(cond, "Expected exception %s wasn't raised" % exc_class.__name__)
 
 def flatten(x):
     result = []
@@ -41,6 +68,7 @@ class TestConnection(object):
 class TestCursor(object):
     def __init__(cursor):
         cursor.description = []
+        cursor.rowcount = 0
     def execute(cursor, sql, args=None):
         pass
     def fetchone(cursor):
@@ -68,7 +96,9 @@ class TestDatabase(Database):
     real_provider_name = None
     raw_server_version = None
     sql = None
-    def bind(self, provider_name, *args, **kwargs):
+    def bind(self, provider, *args, **kwargs):
+        provider_name = provider
+        assert isinstance(provider_name, basestring)
         if self.real_provider_name is not None:
             provider_name = self.real_provider_name
         self.provider_name = provider_name
@@ -81,7 +111,7 @@ class TestDatabase(Database):
             elif provider_name in ('postgres', 'pygresql'): raw_server_version = '9.2'
             elif provider_name == 'oracle': raw_server_version = '11.2.0.2.0'
             elif provider_name == 'mysql': raw_server_version = '5.6.11'
-            else: assert False, provider_name
+            else: assert False, provider_name  # pragma: no cover
 
         t = [ int(component) for component in raw_server_version.split('.') ]
         if len(t) == 2: t.append(0)
@@ -90,6 +120,7 @@ class TestDatabase(Database):
             server_version = int('%d%02d%02d' % server_version)
 
         class TestProvider(provider_cls):
+            json1_available = False  # for SQLite
             def inspect_connection(provider, connection):
                 pass
         TestProvider.server_version = server_version
@@ -98,7 +129,7 @@ class TestDatabase(Database):
         kwargs['pony_pool_mockup'] = TestPool(self)
         Database.bind(self, TestProvider, *args, **kwargs)
     def _execute(database, sql, globals, locals, frame_depth):
-        assert False
+        assert False  # pragma: no cover
     def _exec_sql(database, sql, arguments=None, returning_id=False):
         assert type(arguments) is not list and not returning_id
         database.sql = sql

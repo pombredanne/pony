@@ -1,5 +1,6 @@
 from __future__ import absolute_import, print_function, division
-
+from pony.py23compat import PY2
+from datetime import date
 import unittest
 
 from pony.orm.core import *
@@ -58,7 +59,7 @@ class TestAttribute(unittest.TestCase):
             id = PrimaryKey(int)
             attr1 = Required('Entity2', reverse=123)
 
-    @raises_exception(TypeError, "Reverse option cannot be set for this type: <type 'str'>")
+    @raises_exception(TypeError, "Reverse option cannot be set for this type: %r" % str)
     def test_attribute7(self):
         db = Database('sqlite', ':memory:')
         class Entity1(db.Entity):
@@ -262,11 +263,11 @@ class TestAttribute(unittest.TestCase):
             id = PrimaryKey(int, columns=['a', 'b'])
         db.generate_mapping(create_tables=True)
 
-    @raises_exception(TypeError, "Parameter 'columns' must be a list. Got: set(['a'])'")
+    @raises_exception(TypeError, "Parameter 'columns' must be a list. Got: %r'" % {'a'})
     def test_columns6(self):
         db = Database('sqlite', ':memory:')
         class Entity1(db.Entity):
-            id = PrimaryKey(int, columns=set(['a']))
+            id = PrimaryKey(int, columns={'a'})
         db.generate_mapping(create_tables=True)
 
     @raises_exception(TypeError, "Parameter 'column' must be a string. Got: 4")
@@ -392,7 +393,7 @@ class TestAttribute(unittest.TestCase):
         db.generate_mapping(create_tables=True)
         self.assertEqual(Stat.webinarshow.column, None)
         self.assertEqual(WebinarShow.stats.column, 'stats')
-        
+
     def test_columns_22(self):
         db = Database('sqlite', ':memory:')
         class ZStat(db.Entity):
@@ -420,7 +421,6 @@ class TestAttribute(unittest.TestCase):
             commit()
             Entity1()
             commit()
-        self.assert_(True)
 
     def test_lambda_1(self):
         db = Database('sqlite', ':memory:')
@@ -451,6 +451,225 @@ class TestAttribute(unittest.TestCase):
         class Entity2(db2.Entity):
             b = Set(lambda: db1.Entity1)
         db1.generate_mapping(create_tables=True)
+
+    @raises_exception(ValueError, 'Check for attribute Entity1.a failed. Value: 1')
+    def test_py_check_1(self):
+        db = Database('sqlite', ':memory:')
+        class Entity1(db.Entity):
+            a = Required(int, py_check=lambda val: val > 5 and val < 10)
+        db.generate_mapping(create_tables=True)
+        with db_session:
+            obj = Entity1(a=1)
+
+    def test_py_check_2(self):
+        db = Database('sqlite', ':memory:')
+        class Entity1(db.Entity):
+            a = Required(int, py_check=lambda val: val > 5 and val < 10)
+        db.generate_mapping(create_tables=True)
+        with db_session:
+            obj = Entity1(a=7)
+
+    def test_py_check_3(self):
+        db = Database('sqlite', ':memory:')
+        class Entity1(db.Entity):
+            a = Optional(date, py_check=lambda val: val.year >= 2000)
+        db.generate_mapping(create_tables=True)
+        with db_session:
+            obj = Entity1(a=None)
+
+    @raises_exception(ValueError, 'Check for attribute Entity1.a failed. Value: datetime.date(1999, 1, 1)')
+    def test_py_check_4(self):
+        db = Database('sqlite', ':memory:')
+        class Entity1(db.Entity):
+            a = Optional(date, py_check=lambda val: val.year >= 2000)
+        db.generate_mapping(create_tables=True)
+        with db_session:
+            obj = Entity1(a=date(1999, 1, 1))
+
+    def test_py_check_5(self):
+        db = Database('sqlite', ':memory:')
+        class Entity1(db.Entity):
+            a = Optional(date, py_check=lambda val: val.year >= 2000)
+        db.generate_mapping(create_tables=True)
+        with db_session:
+            obj = Entity1(a=date(2010, 1, 1))
+
+    @raises_exception(ValueError, 'Should be positive number')
+    def test_py_check_6(self):
+        def positive_number(val):
+            if val <= 0: raise ValueError('Should be positive number')
+        db = Database('sqlite', ':memory:')
+        class Entity1(db.Entity):
+            a = Optional(int, py_check=positive_number)
+        db.generate_mapping(create_tables=True)
+        with db_session:
+            obj = Entity1(a=-1)
+
+    def test_py_check_7(self):
+        def positive_number(val):
+            if val <= 0: raise ValueError('Should be positive number')
+            return True
+        db = Database('sqlite', ':memory:')
+        class Entity1(db.Entity):
+            a = Optional(int, py_check=positive_number)
+        db.generate_mapping(create_tables=True)
+        with db_session:
+            obj = Entity1(a=1)
+
+    @raises_exception(NotImplementedError, "'py_check' parameter is not supported for collection attributes")
+    def test_py_check_8(self):
+        db = Database('sqlite', ':memory:')
+        class Entity1(db.Entity):
+            a = Required('Entity2')
+        class Entity2(db.Entity):
+            a = Set('Entity1', py_check=lambda val: True)
+        db.generate_mapping(create_tables=True)
+
+    @raises_exception(ValueError, "Check for attribute Entity1.a failed. Value: " + (
+        "u'12345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345..." if PY2
+        else "'123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456..."
+    ))
+    def test_py_check_truncate(self):
+        db = Database('sqlite', ':memory:')
+        class Entity1(db.Entity):
+            a = Required(str, py_check=lambda val: False)
+        db.generate_mapping(create_tables=True)
+        with db_session:
+            obj = Entity1(a='1234567890' * 1000)
+
+    @raises_exception(ValueError, 'Value for attribute Entity1.a is too long. Max length is 10, value length is 10000')
+    def test_str_max_len(self):
+        db = Database('sqlite', ':memory:')
+        class Entity1(db.Entity):
+            a = Required(str, 10)
+        db.generate_mapping(create_tables=True)
+        with db_session:
+            obj = Entity1(a='1234567890' * 1000)
+
+    def test_foreign_key_sql_type_1(self):
+        db = Database('sqlite', ':memory:')
+        class Foo(db.Entity):
+            id = PrimaryKey(unicode, sql_type='SOME_TYPE')
+            bars = Set('Bar')
+        class Bar(db.Entity):
+            foo = Required(Foo)
+        db.generate_mapping(create_tables=True)
+
+        table = db.schema.tables.get(Bar._table_)
+        sql_type = table.column_list[1].sql_type
+        self.assertEqual(sql_type, 'SOME_TYPE')
+
+    def test_foreign_key_sql_type_2(self):
+        db = Database('sqlite', ':memory:')
+        class Foo(db.Entity):
+            id = PrimaryKey(unicode, sql_type='SOME_TYPE')
+            bars = Set('Bar')
+        class Bar(db.Entity):
+            foo = Required(Foo, sql_type='ANOTHER_TYPE')
+        db.generate_mapping(create_tables=True)
+
+        table = db.schema.tables.get(Bar._table_)
+        sql_type = table.column_list[1].sql_type
+        self.assertEqual(sql_type, 'ANOTHER_TYPE')
+
+    def test_foreign_key_sql_type_3(self):
+        db = Database('sqlite', ':memory:')
+        class Foo(db.Entity):
+            id = PrimaryKey(unicode, sql_type='SERIAL')
+            bars = Set('Bar')
+        class Bar(db.Entity):
+            foo = Required(Foo, sql_type='ANOTHER_TYPE')
+        db.generate_mapping(create_tables=True)
+
+        table = db.schema.tables.get(Bar._table_)
+        sql_type = table.column_list[1].sql_type
+        self.assertEqual(sql_type, 'ANOTHER_TYPE')
+
+    def test_foreign_key_sql_type_4(self):
+        db = Database('sqlite', ':memory:')
+        class Foo(db.Entity):
+            id = PrimaryKey(unicode, sql_type='SERIAL')
+            bars = Set('Bar')
+        class Bar(db.Entity):
+            foo = Required(Foo)
+        db.generate_mapping(create_tables=True)
+
+        table = db.schema.tables.get(Bar._table_)
+        sql_type = table.column_list[1].sql_type
+        self.assertEqual(sql_type, 'INTEGER')
+
+    def test_foreign_key_sql_type_5(self):
+        db = Database('sqlite', ':memory:')
+        class Foo(db.Entity):
+            id = PrimaryKey(unicode, sql_type='serial')
+            bars = Set('Bar')
+        class Bar(db.Entity):
+            foo = Required(Foo)
+        db.generate_mapping(create_tables=True)
+
+        table = db.schema.tables.get(Bar._table_)
+        sql_type = table.column_list[1].sql_type
+        self.assertEqual(sql_type, 'integer')
+
+    def test_self_referenced_m2m_1(self):
+        db = Database('sqlite', ':memory:')
+        class Node(db.Entity):
+            id = PrimaryKey(int)
+            prev_nodes = Set("Node")
+            next_nodes = Set("Node")
+        db.generate_mapping(create_tables=True)
+
+    def test_implicit_1(self):
+        db = Database('sqlite', ':memory:')
+        class Foo(db.Entity):
+            name = Required(str)
+            bar = Required("Bar")
+        class Bar(db.Entity):
+            id = PrimaryKey(int)
+            name = Optional(str)
+            foos = Set("Foo")
+        db.generate_mapping(create_tables=True)
+
+        self.assertTrue(Foo.id.is_implicit)
+        self.assertFalse(Foo.name.is_implicit)
+        self.assertFalse(Foo.bar.is_implicit)
+
+        self.assertFalse(Bar.id.is_implicit)
+        self.assertFalse(Bar.name.is_implicit)
+        self.assertFalse(Bar.foos.is_implicit)
+
+    def test_implicit_2(self):
+        db = Database('sqlite', ':memory:')
+        class Foo(db.Entity):
+            x = Required(str)
+        class Bar(Foo):
+            y = Required(str)
+        db.generate_mapping(create_tables=True)
+
+        self.assertTrue(Foo.id.is_implicit)
+        self.assertTrue(Foo.classtype.is_implicit)
+        self.assertFalse(Foo.x.is_implicit)
+
+        self.assertTrue(Bar.id.is_implicit)
+        self.assertTrue(Bar.classtype.is_implicit)
+        self.assertFalse(Bar.x.is_implicit)
+        self.assertFalse(Bar.y.is_implicit)
+
+    @raises_exception(TypeError, 'Attribute Foo.x has invalid type NoneType')
+    def test_none_type(self):
+        db = Database('sqlite', ':memory:')
+        class Foo(db.Entity):
+            x = Required(type(None))
+        db.generate_mapping(create_tables=True)
+
+    @raises_exception(TypeError, "'sql_default' option value cannot be empty string, "
+                                 "because it should be valid SQL literal or expression. "
+                                 "Try to use \"''\", or just specify default='' instead.")
+    def test_none_type(self):
+        db = Database('sqlite', ':memory:')
+        class Foo(db.Entity):
+            x = Required(str, sql_default='')
+
 
 if __name__ == '__main__':
     unittest.main()
